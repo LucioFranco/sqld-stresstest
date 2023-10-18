@@ -1,9 +1,10 @@
-use itertools::Itertools;
+use libsql::Database;
 use std::{
     collections::VecDeque,
+    env,
     io::{BufRead, Read},
 };
-use tokio::task::JoinSet;
+use tokio::{process::Command, task::JoinSet};
 
 use anyhow::{Context, Result};
 use bytes::Buf;
@@ -15,14 +16,109 @@ async fn main() -> Result<()> {
 
     let mut set = JoinSet::new();
 
+    let task = env::args().nth(1);
+
+    match task.as_deref() {
+        Some("build") => run_local(&mut set).await?,
+        Some("fly") => run_fly(&mut set).await?,
+        _ => todo!("help page"),
+    }
+
+    while let Some(_) = set.join_next().await {}
+
+    println!("done");
+
+    Ok(())
+}
+
+async fn run_fly(set: &mut JoinSet<()>) -> Result<()> {
+    let stmts = load_file("speedtest1.sql")?;
+
+    let namespaces = ["bar1"];
+
+    for namespace in namespaces {
+        let stmts = stmts.clone();
+        set.spawn(async move {
+            if let Err(e) = run_fly_namespace(namespace, stmts).await {
+                eprintln!("error: {:?}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn run_fly_namespace(namespace: &str, stmts: VecDeque<String>) -> Result<()> {
+    // let url = turso_db_url(namespace).await.context("show url")?;
+    // let token = turso_db_token(namespace).await.context("create token")?;
+    let url = "http://localhost:8080";
+    let token = "";
+
+    let db = Database::open_remote(url, token).context("open remote")?;
+
+    let conn = db.connect().context("connect")?;
+
+    for stmt in stmts.into_iter().take(150) {
+        if let Err(e) = conn
+            .execute(&stmt, ())
+            .await
+            .with_context(|| format!("execute failed with: {}", stmt))
+        {
+            if !format!("{:?}", e).contains("already exists") {
+                eprintln!("{:?}", e);
+            }
+        };
+    }
+
+    conn.execute("SELECT 1", ())
+        .await
+        .context("execute SELECT 1")?;
+
+    Ok(())
+}
+
+async fn turso_db_url(namespace: &str) -> Result<String> {
+    let out = Command::new("turso")
+        .arg("db")
+        .arg("show")
+        .arg("--url")
+        .arg(namespace)
+        .output()
+        .await
+        .context("turso db show --url")?;
+
+    if !out.status.success() {
+        let msg = String::from_utf8(out.stderr)?;
+        anyhow::bail!("non-zero exit: {} msg: {}", out.status, msg)
+    }
+
+    let out = String::from_utf8(out.stdout)?;
+
+    Ok(out.replace("\n", ""))
+}
+
+async fn turso_db_token(namespace: &str) -> Result<String> {
+    let out = Command::new("turso")
+        .arg("db")
+        .arg("tokens")
+        .arg("create")
+        .arg(namespace)
+        .output()
+        .await
+        .context("turso db create token")?;
+
+    if !out.status.success() {
+        let msg = String::from_utf8(out.stderr)?;
+        anyhow::bail!("non-zero exit: {} msg: {}", out.status, msg)
+    }
+
+    Ok(String::from_utf8(out.stdout)?.replace("\n", ""))
+}
+
+async fn run_local(set: &mut JoinSet<()>) -> Result<()> {
     let client = Client::default();
 
     let stmts = load_file("speedtest1.sql")?;
-
-    //     let stmts = stmts
-    //         .into_iter()
-    //         .batching(|it| Some(it.take(50).collect::<Vec<_>>()))
-    //         .collect::<Vec<_>>();
 
     for i in 0..50 {
         let namespace = format!("4ar-{}", i);
@@ -34,10 +130,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    while let Some(_) = set.join_next().await {}
-
-    println!("done");
 
     Ok(())
 }
